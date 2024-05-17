@@ -219,6 +219,16 @@ class BTS7960: public MotorInterface
             analogWrite(in_a_pin_, 0);
             analogWrite(in_b_pin_, 0);
         }
+        
+        /*void spin(int pwm) {
+            if(pwm > 0) {
+                forward(pwm);
+            } else if(pwm < 0) {
+                reverse(-pwm); // Make sure to pass a positive PWM for reverse
+            } else {
+                brake();
+            }
+        }*/
 
         void brake() override
         {

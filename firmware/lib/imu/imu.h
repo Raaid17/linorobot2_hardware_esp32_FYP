@@ -40,6 +40,10 @@
     #define IMU QMI8658IMU
 #endif
 
+#ifdef USE_ICM20948_IMU
+    #define IMU AdafruitICM20948IMU
+#endif
+
 #ifndef IMU
     #define USE_FAKE_IMU
     #define IMU FakeIMU

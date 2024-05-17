@@ -17,7 +17,9 @@
 
 //include IMU base interface
 #include "imu_interface.h"
-
+#include "Adafruit_ICM20X.h"
+#include "Adafruit_Sensor.h"
+#include <Wire.h>
 //include sensor API headers
 #include "I2Cdev.h"
 #include "ADXL345.h"
@@ -27,6 +29,8 @@
 #include "MPU9150.h"
 #include "MPU9250.h"
 #include "QMI8658.h"
+#include "Adafruit_ICM20948.h"  // Include the Adafruit ICM20948 library
+
 
 class GY85IMU: public IMUInterface 
 {
@@ -355,6 +359,72 @@ class QMI8658IMU: public IMUInterface
         }
 };
 
+class AdafruitICM20948IMU : public IMUInterface {
+private:
+    Adafruit_ICM20948 icm20948;  // Instance of the Adafruit_ICM20948
+    //const float accel_scale_ = 1 / 8192.0;  // Scale factor for accelerometer (assuming +/- 4g range for 16-bit data)
+    //const float gyro_scale_ = 1 / 32.8;     // Scale factor for gyroscope (assuming +/- 1000 degrees/sec range for 16-bit data)
+    
+    
+    sensors_event_t accel;
+    sensors_event_t gyro;
+    sensors_event_t mag;
+    sensors_event_t temp;
+	
+    
+    geometry_msgs__msg__Vector3 accel_;
+    geometry_msgs__msg__Vector3 gyro_;
+
+public:
+    AdafruitICM20948IMU() {
+        // Constructor, potentially initialize member variables if needed
+    }
+
+    bool startSensor() override {
+        Wire.begin();  // Start the I2C
+        if (!icm20948.begin_I2C()) {
+            //Serial.println("Failed to find ICM20948 chip");
+            return false;  // Failed to connect to the sensor
+            while (1) {
+         delay(10);
+         }
+        }
+
+        icm20948.setAccelRange(ICM20948_ACCEL_RANGE_4_G);  // Set accelerometer to +/- 4g
+        icm20948.setGyroRange(ICM20948_GYRO_RANGE_1000_DPS);  // Set gyroscope to +/- 1000 dps
+        //icm20948.setMagDataRate(AK09916_MAG_DATARATE_100_HZ);  // Set magnetometer data rate to 100 Hz
+
+  uint16_t accel_divisor = icm20948.getAccelRateDivisor();
+  float accel_rate = 1125 / (1.0 + accel_divisor);
+
+  uint8_t gyro_divisor = icm20948.getGyroRateDivisor();
+  float gyro_rate = 1100 / (1.0 + gyro_divisor);
+   //icm20948.setAccelRateDivisor(4095);
+   //icm20948.setGyroRateDivisor(255);
+        //Serial.println("ICM20948 initialized successfully");
+        return true;
+    }
+
+    geometry_msgs__msg__Vector3 readAccelerometer() override {
+    
+        
+	icm20948.getEvent(&accel, &gyro, &temp, &mag);
+        accel_.x = accel.acceleration.x ;  // Convert to standard units (m/s^2)
+        accel_.y = accel.acceleration.y ;
+        accel_.z = accel.acceleration.z ;
+        return accel_;
+    }
+
+    geometry_msgs__msg__Vector3 readGyroscope() override {
+    
+        
+  	icm20948.getEvent(&accel, &gyro, &temp, &mag);
+        gyro_.x = gyro.gyro.x;  // Convert to radians per second
+        gyro_.y = gyro.gyro.y;
+        gyro_.z = gyro.gyro.z;
+        return gyro_;
+    }
+};
 #endif
 //ADXL345 https://www.sparkfun.com/datasheets/Sensors/Accelerometer/ADXL345.pdf
 //HMC8553L https://cdn-shop.adafruit.com/datasheets/HMC5883L_3-Axis_Digital_Compass_IC.pdf

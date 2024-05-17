@@ -26,6 +26,8 @@
 #include "AK8975.h"
 #include "AK09918.h"
 #include "QMC5883L.h"
+#include <Adafruit_ICM20948.h>
+#include <Adafruit_ICM20X.h>
 
 class HMC5883LMAG: public MAGInterface
 {
@@ -269,6 +271,56 @@ class FakeMAG: public MAGInterface
 
         geometry_msgs__msg__Vector3 readMagnetometer() override
         {
+            return mag_;
+        }
+};
+
+class AK09916MAG: public MAGInterface
+{
+    private:
+    Adafruit_ICM20948 icm20948;  // Instance of the Adafruit_ICM20948
+
+    
+
+        // returned vector for sensor reading
+        geometry_msgs__msg__Vector3 mag_;
+
+    public:
+        AK09916MAG()
+        {
+        }
+
+        bool startSensor() override
+        {
+           Wire.begin();  // Start the I2C
+        if (!icm20948.begin_I2C()) {
+            //Serial.println("Failed to find ICM20948 chip");
+            return false;  // Failed to connect to the sensor
+            while (1) {
+         delay(10);
+         }
+        }
+
+        icm20948.setMagDataRate(AK09916_MAG_DATARATE_100_HZ);  // Set magnetometer data rate to 100 Hz
+        
+        return true;
+        }
+
+        geometry_msgs__msg__Vector3 readMagnetometer() override
+        {
+            // here you can override readMagnetometer function and use the sensor's driver API
+            // to grab the data from magnetometer and return as a Vector3 object
+  	    sensors_event_t accel;
+  	    sensors_event_t gyro;
+  	    sensors_event_t mag;
+  	    sensors_event_t temp;
+  	    icm20948.getEvent(&accel, &gyro, &temp, &mag);
+
+
+            mag_.x = mag.magnetic.x;
+            mag_.y = mag.magnetic.y;
+            mag_.z = mag.magnetic.z;
+
             return mag_;
         }
 };

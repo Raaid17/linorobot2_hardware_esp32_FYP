@@ -41,6 +41,11 @@
     #define MAG QMC5883LMAG
 #endif
 
+#ifdef USE_AK09916_MAG
+    #define MAG AK09916MAG
+#endif
+
+
 #ifndef MAG // use fake mag when there is no real mag
     #define USE_FAKE_MAG
     #define MAG FakeMAG

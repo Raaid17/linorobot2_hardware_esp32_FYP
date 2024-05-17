@@ -1,25 +1,11 @@
-// Copyright (c) 2021 Juan Miguel Jimeno
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
 #include <Arduino.h>
 #include <micro_ros_platformio.h>
 #include <stdio.h>
-
+#include <rmw/types.h>
 #include <rcl/rcl.h>
 #include <rcl/error_handling.h>
 #include <rclc/rclc.h>
 #include <rclc/executor.h>
-
 #include <nav_msgs/msg/odometry.h>
 #include <sensor_msgs/msg/imu.h>
 #include <sensor_msgs/msg/magnetic_field.h>
@@ -27,12 +13,11 @@
 #include <sensor_msgs/msg/range.h>
 #include <geometry_msgs/msg/twist.h>
 #include <geometry_msgs/msg/vector3.h>
-
 #include "config.h"
 #include "syslog.h"
 #include "motor.h"
 #include "kinematics.h"
-#include "pid.h"
+#include "PID_v1.h"
 #include "odometry.h"
 #include "imu.h"
 #include "mag.h"
@@ -44,18 +29,23 @@
 #include "lidar.h"
 #include "wifis.h"
 #include "ota.h"
+#include <std_msgs/msg/float32_multi_array.h>
+
+rcl_publisher_t motor_speeds_publisher;
+std_msgs__msg__Float32MultiArray motor_speeds_msg;
+
+rcl_publisher_t setpoint_publisher;
+std_msgs__msg__Float32MultiArray setpoint_msg;
 
 #ifdef WDT_TIMEOUT
 #include <esp_task_wdt.h>
 #endif
 #ifdef USE_WIFI_TRANSPORT
-// remove wifi initialization code from wifi transport
 static inline void set_microros_net_transports(IPAddress agent_ip, uint16_t agent_port)
 {
     static struct micro_ros_agent_locator locator;
     locator.address = agent_ip;
     locator.port = agent_port;
-
     rmw_uros_set_custom_transport(
         false,
         (void *) &locator,
@@ -79,10 +69,10 @@ static inline void set_microros_net_transports(IPAddress agent_ip, uint16_t agen
 #endif
 
 #ifndef RCCHECK
-#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){rclErrorLoop();}}
+#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){rclErrorLoop(temp_rc);}}
 #endif
 #ifndef RCSOFTCHECK
-#define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){}}
+#define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){syslog(LOG_ERR, "Soft Error: %s", rcl_get_error_string().str); rcl_reset_error();}}
 #endif
 #define EXECUTE_EVERY_N_MS(MS, X)  do { \
   static volatile int64_t init = -1; \
@@ -112,9 +102,18 @@ rcl_timer_t control_timer;
 rcl_timer_t battery_timer;
 rcl_timer_t range_timer;
 
+rmw_qos_profile_t reliable_qos = rmw_qos_profile_default;
+
+double setPoint1 = 0.0, input1 = 0.0, output1 = 0.0;
+double setPoint2 = 0.0, input2 = 0.0, output2 = 0.0;
+
+PID motor1_pid(&input1, &output1, &setPoint1, K_P_M1, K_I_M1, K_D_M1, DIRECT);
+PID motor2_pid(&input2, &output2, &setPoint2, K_P_M2, K_I_M2, K_D_M2, DIRECT);
+
 unsigned long long time_offset = 0;
 unsigned long prev_cmd_time = 0;
 unsigned long prev_odom_update = 0;
+unsigned long last_setpoint_time = 0;  // Add this line
 
 enum states 
 {
@@ -126,18 +125,9 @@ enum states
 
 Encoder motor1_encoder(MOTOR1_ENCODER_A, MOTOR1_ENCODER_B, COUNTS_PER_REV1, MOTOR1_ENCODER_INV);
 Encoder motor2_encoder(MOTOR2_ENCODER_A, MOTOR2_ENCODER_B, COUNTS_PER_REV2, MOTOR2_ENCODER_INV);
-Encoder motor3_encoder(MOTOR3_ENCODER_A, MOTOR3_ENCODER_B, COUNTS_PER_REV3, MOTOR3_ENCODER_INV);
-Encoder motor4_encoder(MOTOR4_ENCODER_A, MOTOR4_ENCODER_B, COUNTS_PER_REV4, MOTOR4_ENCODER_INV);
 
 Motor motor1_controller(PWM_FREQUENCY, PWM_BITS, MOTOR1_INV, MOTOR1_PWM, MOTOR1_IN_A, MOTOR1_IN_B);
 Motor motor2_controller(PWM_FREQUENCY, PWM_BITS, MOTOR2_INV, MOTOR2_PWM, MOTOR2_IN_A, MOTOR2_IN_B);
-Motor motor3_controller(PWM_FREQUENCY, PWM_BITS, MOTOR3_INV, MOTOR3_PWM, MOTOR3_IN_A, MOTOR3_IN_B);
-Motor motor4_controller(PWM_FREQUENCY, PWM_BITS, MOTOR4_INV, MOTOR4_PWM, MOTOR4_IN_A, MOTOR4_IN_B);
-
-PID motor1_pid(PWM_MIN, PWM_MAX, K_P, K_I, K_D);
-PID motor2_pid(PWM_MIN, PWM_MAX, K_P, K_I, K_D);
-PID motor3_pid(PWM_MIN, PWM_MAX, K_P, K_I, K_D);
-PID motor4_pid(PWM_MIN, PWM_MAX, K_P, K_I, K_D);
 
 Kinematics kinematics(
     Kinematics::LINO_BASE, 
@@ -155,23 +145,23 @@ MAG mag;
 
 void setup() 
 {
-#ifdef BOARD_INIT // board specific setup
+#ifdef BOARD_INIT
     BOARD_INIT;
 #endif
 
     Serial.begin(BAUDRATE);
     pinMode(LED_PIN, OUTPUT);
-#ifdef SDA_PIN // specify I2C pins
+#ifdef SDA_PIN
 #ifdef ESP32
     Wire.begin(SDA_PIN, SCL_PIN);
-#else // teensy
+#else
     Wire.setSDA(SDA_PIN);
     Wire.setSCL(SCL_PIN);
 #endif
 #endif
 #ifdef WDT_TIMEOUT
-    esp_task_wdt_init(WDT_TIMEOUT, true); //enable panic so ESP32 restarts
-    esp_task_wdt_add(NULL); //add current thread to WDT watch
+    esp_task_wdt_init(WDT_TIMEOUT, true);
+    esp_task_wdt_add(NULL);
 #endif
     initWifis();
     initOta();
@@ -187,17 +177,30 @@ void setup()
     mag.init();
     initBattery();
     initRange();
-    initLidar(); // after wifi connected
+    initLidar();
 
 #ifdef USE_WIFI_TRANSPORT
     set_microros_net_transports(AGENT_IP, AGENT_PORT);
 #else
     set_microros_serial_transports(Serial);
 #endif
+
     syslog(LOG_INFO, "%s Ready %lu", __FUNCTION__, millis());
+    
+    motor1_pid.SetMode(AUTOMATIC);
+    motor1_pid.SetOutputLimits(-255, 255);
+    motor2_pid.SetMode(AUTOMATIC);
+    motor2_pid.SetOutputLimits(-255, 255);
+
+    reliable_qos.reliability = RMW_QOS_POLICY_RELIABILITY_RELIABLE;
+    reliable_qos.durability = RMW_QOS_POLICY_DURABILITY_VOLATILE;
+    reliable_qos.history = RMW_QOS_POLICY_HISTORY_KEEP_LAST;
+    reliable_qos.depth = 10;
 }
 
 void loop() {
+    unsigned long current_time = millis();  // Add this line
+
     switch (state) 
     {
         case WAITING_AGENT:
@@ -227,6 +230,7 @@ void loop() {
         default:
             break;
     }
+
     runWifis();
     runOta();
 #ifdef WDT_TIMEOUT
@@ -250,10 +254,10 @@ void batteryCallback(rcl_timer_t * timer, int64_t last_call_time)
     if (timer != NULL)
     {
         battery_msg = getBattery();
-	struct timespec time_stamp = getTime();
-	battery_msg.header.stamp.sec = time_stamp.tv_sec;
-	battery_msg.header.stamp.nanosec = time_stamp.tv_nsec;
-	RCSOFTCHECK(rcl_publish(&battery_publisher, &battery_msg, NULL));
+        struct timespec time_stamp = getTime();
+        battery_msg.header.stamp.sec = time_stamp.tv_sec;
+        battery_msg.header.stamp.nanosec = time_stamp.tv_nsec;
+        RCSOFTCHECK(rcl_publish(&battery_publisher, &battery_msg, NULL));
     }
 }
 
@@ -263,77 +267,83 @@ void rangeCallback(rcl_timer_t * timer, int64_t last_call_time)
     if (timer != NULL)
     {
         range_msg = getRange();
-	struct timespec time_stamp = getTime();
-	range_msg.header.stamp.sec = time_stamp.tv_sec;
-	range_msg.header.stamp.nanosec = time_stamp.tv_nsec;
-	RCSOFTCHECK(rcl_publish(&range_publisher, &range_msg, NULL));
+        struct timespec time_stamp = getTime();
+        range_msg.header.stamp.sec = time_stamp.tv_sec;
+        range_msg.header.stamp.nanosec = time_stamp.tv_nsec;
+        RCSOFTCHECK(rcl_publish(&range_publisher, &range_msg, NULL));
     }
 }
 
 void twistCallback(const void * msgin) 
 {
     digitalWrite(LED_PIN, !digitalRead(LED_PIN));
-
     prev_cmd_time = millis();
+    last_setpoint_time = millis();  // Update the last setpoint time
 }
 
-bool createEntities()
+bool createEntities() 
 {
     syslog(LOG_INFO, "%s %lu", __FUNCTION__, millis());
     allocator = rcl_get_default_allocator();
-    //create init_options
     RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
-    // create node
     RCCHECK(rclc_node_init_default(&node, NODE_NAME, "", &support));
-    // create odometry publisher
-    RCCHECK(rclc_publisher_init_default( 
-        &odom_publisher, 
+
+    RCCHECK(rclc_publisher_init(
+        &odom_publisher,
         &node,
         ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
-        TOPIC_PREFIX "odom/unfiltered"
+        TOPIC_PREFIX "odom/unfiltered",
+        &reliable_qos
     ));
-    // create IMU publisher
-    RCCHECK(rclc_publisher_init_default( 
-        &imu_publisher, 
+
+    RCCHECK(rclc_publisher_init(
+        &imu_publisher,
         &node,
         ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu),
-        TOPIC_PREFIX "imu/data"
+        TOPIC_PREFIX "imu/data",
+        &reliable_qos
     ));
-    RCCHECK(rclc_publisher_init_default(
+
+    RCCHECK(rclc_publisher_init(
         &mag_publisher,
         &node,
         ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, MagneticField),
-        TOPIC_PREFIX "imu/mag"
+        TOPIC_PREFIX "imu/mag",
+        &reliable_qos
     ));
-    // create battery pyblisher
-    RCCHECK(rclc_publisher_init_default(
-	&battery_publisher,
-	&node,
-	ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, BatteryState),
-	TOPIC_PREFIX "battery"
+
+    RCCHECK(rclc_publisher_init(
+        &battery_publisher,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, BatteryState),
+        TOPIC_PREFIX "battery",
+        &reliable_qos
     ));
-    // create range pyblisher
-    RCCHECK(rclc_publisher_init_default(
-	&range_publisher,
-	&node,
-	ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Range),
-	TOPIC_PREFIX "ultrasound"
+
+    RCCHECK(rclc_publisher_init(
+        &range_publisher,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Range),
+        TOPIC_PREFIX "ultrasound",
+        &reliable_qos
     ));
-    // create twist command subscriber
-    RCCHECK(rclc_subscription_init_default( 
-        &twist_subscriber, 
+
+    RCCHECK(rclc_subscription_init(
+        &twist_subscriber,
         &node,
         ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
-        TOPIC_PREFIX "cmd_vel"
+        TOPIC_PREFIX "cmd_vel",
+        &reliable_qos
     ));
-    // create timer for actuating the motors at 50 Hz (1000/20)
+
     const unsigned int control_timeout = 20;
-    RCCHECK(rclc_timer_init_default( 
-        &control_timer, 
+    RCCHECK(rclc_timer_init_default(
+        &control_timer,
         &support,
         RCL_MS_TO_NS(control_timeout),
         controlCallback
     ));
+
     const unsigned int battery_timer_timeout = 2000;
     RCCHECK(rclc_timer_init_default(
         &battery_timer,
@@ -341,6 +351,7 @@ bool createEntities()
         RCL_MS_TO_NS(battery_timer_timeout),
         batteryCallback
     ));
+
     const unsigned int range_timer_timeout = 100;
     RCCHECK(rclc_timer_init_default(
         &range_timer,
@@ -348,22 +359,45 @@ bool createEntities()
         RCL_MS_TO_NS(range_timer_timeout),
         rangeCallback
     ));
+
     executor = rclc_executor_get_zero_initialized_executor();
-    RCCHECK(rclc_executor_init(&executor, &support.context, 4, & allocator));
+    RCCHECK(rclc_executor_init(&executor, &support.context, 4, &allocator));
     RCCHECK(rclc_executor_add_subscription(
-        &executor, 
-        &twist_subscriber, 
-        &twist_msg, 
-        &twistCallback, 
+        &executor,
+        &twist_subscriber,
+        &twist_msg,
+        &twistCallback,
         ON_NEW_DATA
     ));
+
     RCCHECK(rclc_executor_add_timer(&executor, &control_timer));
     RCCHECK(rclc_executor_add_timer(&executor, &battery_timer));
     RCCHECK(rclc_executor_add_timer(&executor, &range_timer));
 
-    // synchronize time with the agent
     syncTime();
     digitalWrite(LED_PIN, HIGH);
+
+    RCCHECK(rclc_publisher_init_best_effort(
+        &motor_speeds_publisher,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray),
+        "motor_speeds"
+    ));
+    std_msgs__msg__Float32MultiArray__init(&motor_speeds_msg);
+    motor_speeds_msg.data.capacity = 4;
+    motor_speeds_msg.data.size = 4;
+    motor_speeds_msg.data.data = (float*)malloc(motor_speeds_msg.data.capacity * sizeof(float));
+
+    RCCHECK(rclc_publisher_init_best_effort(
+        &setpoint_publisher,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray),
+        "setpoints"
+    ));
+    std_msgs__msg__Float32MultiArray__init(&setpoint_msg);
+    setpoint_msg.data.capacity = 8;
+    setpoint_msg.data.size = 8;
+    setpoint_msg.data.data = (float*)realloc(setpoint_msg.data.data, setpoint_msg.data.capacity * sizeof(float));
 
     return true;
 }
@@ -389,6 +423,14 @@ bool destroyEntities()
 
     digitalWrite(LED_PIN, HIGH);
     
+    rcl_publisher_fini(&motor_speeds_publisher, &node);
+    std_msgs__msg__Float32MultiArray__fini(&motor_speeds_msg);
+    free(motor_speeds_msg.data.data);
+
+    rcl_publisher_fini(&setpoint_publisher, &node);
+    std_msgs__msg__Float32MultiArray__fini(&setpoint_msg);
+    free(setpoint_msg.data.data);
+    
     return true;
 }
 
@@ -400,54 +442,62 @@ void fullStop()
 
     motor1_controller.brake();
     motor2_controller.brake();
-    motor3_controller.brake();
-    motor4_controller.brake();
 }
 
 void moveBase()
 {
-    // brake if there's no command received, or when it's only the first command sent
     if(((millis() - prev_cmd_time) >= 200)) 
     {
         twist_msg.linear.x = 0.0;
         twist_msg.linear.y = 0.0;
         twist_msg.angular.z = 0.0;
+        
+        setPoint1 = 0;
+        setPoint2 = 0;
 
         digitalWrite(LED_PIN, HIGH);
     }
+    else
+    {
+        Kinematics::rpm req_rpm = kinematics.getRPM(
+            twist_msg.linear.x, 
+            twist_msg.linear.y, 
+            twist_msg.angular.z
+        );
     
-    // get the required rpm for each motor based on required velocities, and base used
-    Kinematics::rpm req_rpm = kinematics.getRPM(
-        twist_msg.linear.x, 
-        twist_msg.linear.y, 
-        twist_msg.angular.z
-    );
+        setPoint1 = req_rpm.motor1;
+        setPoint2 = req_rpm.motor2;
+    }
 
-    // get the current speed of each motor
     float current_rpm1 = motor1_encoder.getRPM();
     float current_rpm2 = motor2_encoder.getRPM();
-    float current_rpm3 = motor3_encoder.getRPM();
-    float current_rpm4 = motor4_encoder.getRPM();
 
     if(twist_msg.linear.x == 0.0 && twist_msg.angular.z == 0.0){
         fullStop();
-
     }else{
-
-        // the required rpm is capped at -/+ MAX_RPM to prevent the PID from having too much error
-        // the PWM value sent to the motor driver is the calculated PID based on required RPM vs measured RPM
-        motor1_controller.spin(motor1_pid.compute(req_rpm.motor1, current_rpm1));
-        motor2_controller.spin(motor2_pid.compute(req_rpm.motor2, current_rpm2));
-        motor3_controller.spin(motor3_pid.compute(req_rpm.motor3, current_rpm3));
-        motor4_controller.spin(motor4_pid.compute(req_rpm.motor4, current_rpm4));
+        input1 = current_rpm1;
+        input2 = current_rpm2;
+        
+        motor1_pid.Compute();
+        motor2_pid.Compute();
+        
+        motor1_controller.spin(output1);
+        motor2_controller.spin(output2);
     }
 
     Kinematics::velocities current_vel = kinematics.getVelocities(
         current_rpm1, 
         current_rpm2, 
-        current_rpm3, 
-        current_rpm4
+        0, // Add default values for motor3 and motor4
+        0  // Add default values for motor3 and motor4
     );
+
+    publishSetpointsAndOutputs();
+
+    motor_speeds_msg.data.data[0] = input1;
+    motor_speeds_msg.data.data[1] = input2;
+
+    RCSOFTCHECK(rcl_publish(&motor_speeds_publisher, &motor_speeds_msg, NULL));
 
     unsigned long now = millis();
     float vel_dt = (now - prev_odom_update) / 1000.0;
@@ -458,6 +508,16 @@ void moveBase()
         current_vel.linear_y, 
         current_vel.angular_z
     );
+}
+
+void publishSetpointsAndOutputs() {
+    setpoint_msg.data.data[0] = setPoint1;
+    setpoint_msg.data.data[1] = setPoint2;
+
+    setpoint_msg.data.data[2] = input1;
+    setpoint_msg.data.data[3] = input2;
+
+    RCSOFTCHECK(rcl_publish(&setpoint_publisher, &setpoint_msg, NULL));
 }
 
 void publishData()
@@ -471,15 +531,12 @@ void publishData()
     mag_msg.magnetic_field.y -= mag_bias[1];
     mag_msg.magnetic_field.z -= mag_bias[2];
 #endif
-    // https://github.com/hiwad-aziz/ros2_mpu9250_driver
-    // Calculate Euler angles
     double roll, pitch, yaw;
     roll = atan2(imu_msg.linear_acceleration.y, imu_msg.linear_acceleration.z);
     pitch = atan2(-imu_msg.linear_acceleration.y,
                 (sqrt(imu_msg.linear_acceleration.y * imu_msg.linear_acceleration.y +
                       imu_msg.linear_acceleration.z * imu_msg.linear_acceleration.z)));
     yaw = atan2(mag_msg.magnetic_field.y, mag_msg.magnetic_field.x);
-    // Convert to quaternion
     double cy = cos(yaw * 0.5);
     double sy = sin(yaw * 0.5);
     double cp = cos(pitch * 0.5);
@@ -510,23 +567,20 @@ void publishData()
 bool syncTime()
 {
     const int timeout_ms = 1000;
-    if (rmw_uros_epoch_synchronized()) return true; // synchronized previously
-    // get the current time from the agent
+    if (rmw_uros_epoch_synchronized()) return true;
     RCCHECK(rmw_uros_sync_session(timeout_ms));
     if (rmw_uros_epoch_synchronized()) {
 #if (_POSIX_TIMERS > 0)
-        // Get time in milliseconds or nanoseconds
         int64_t time_ns = rmw_uros_epoch_nanos();
-	timespec tp;
-	tp.tv_sec = time_ns / 1000000000;
-	tp.tv_nsec = time_ns % 1000000000;
-	clock_settime(CLOCK_REALTIME, &tp);
+        timespec tp;
+        tp.tv_sec = time_ns / 1000000000;
+        tp.tv_nsec = time_ns % 1000000000;
+        clock_settime(CLOCK_REALTIME, &tp);
 #else
-	unsigned long long ros_time_ms = rmw_uros_epoch_millis();
-	// now we can find the difference between ROS time and uC time
-	time_offset = ros_time_ms - millis();
+        unsigned long long ros_time_ms = rmw_uros_epoch_millis();
+        time_offset = ros_time_ms - millis();
 #endif
-	return true;
+        return true;
     }
     return false;
 }
@@ -537,8 +591,6 @@ struct timespec getTime()
 #if (_POSIX_TIMERS > 0)
     clock_gettime(CLOCK_REALTIME, &tp);
 #else
-    // add time difference between uC time and ROS time to
-    // synchronize time with ROS
     unsigned long long now = millis() + time_offset;
     tp.tv_sec = now / 1000;
     tp.tv_nsec = (now % 1000) * 1000000;
@@ -546,12 +598,14 @@ struct timespec getTime()
     return tp;
 }
 
-void rclErrorLoop() 
+void rclErrorLoop(rcl_ret_t error_code) 
 {
+    syslog(LOG_ERR, "RCL Error: %s", rcl_get_error_string().str);
+    rcl_reset_error();
     while(true)
     {
         flashLED(2);
-	runOta();
+        runOta();
     }
 }
 
@@ -566,3 +620,4 @@ void flashLED(int n_times)
     }
     delay(1000);
 }
+
